@@ -1,0 +1,474 @@
+%let START_DATE = '01JAN2024'd;
+%let END_DATE   = '31DEC2024'd;
+/* step 1 import crsp */
+
+proc import datafile = "crsp2024.csv"
+
+	out = crsp_raw
+	dbms =csv
+	replace;
+	guessingrows = max;
+	getnames = yes;
+run;
+
+
+data crsp;
+	set crsp_raw;
+
+	MthCalDt_num = input(strip(MthCalDt), anydtdte.);
+	format MthCalDt_num date9.;
+	drop MthCalDt;
+	rename MthCalDt_num = MthCalDt;
+
+	/* keep only jan-dec 2024 */
+	if &START_DATE <= MthCalDt <= &END_DATE;
+run;
+
+
+/* step 2 import compustat */
+
+proc import datafile = "compustat2024.csv"
+	out = compustat_raw
+	dbms = csv
+	replace;
+	guessingrows = max;
+	getnames = yes;
+run;
+
+/*filter for fiscal year 2024 only */
+
+data compustat;
+	set compustat_raw;
+
+	/* convert datadate to sas date */
+	datadate_num = input(strip(datadate), anydtdte.);
+	format datadate_num date9.;
+	drop datadate;
+	rename datadate_num = datadate;
+
+	/* keep 2024 obs only */
+	if year(datadate) = 2024;
+run;
+
+proc contents data = compustat_raw; run;
+/* import ccm link table */
+
+proc import datafile = "ccm_link.csv"
+	out = ccm_raw
+	dbms = csv
+	replace;
+	guessingrows = max;
+	getnames = yes;
+run;
+
+/* clean ccm link */
+
+data ccm;
+
+	set ccm_raw;
+	/* convert link dates to sas dates */
+	linkdt_num = input(strip(linkdt), anydtdte.);
+	linkenddt_num = input(strip(linkenddt), anydtdte.);
+	if missing(linkenddt_num) then linkenddt_num = '31DEC9999'd;
+
+	/*keep only common stock link types */
+	if linktype in ("LC", "LU", "LS");
+
+	format linkdt_num linkenddt_num date9.;
+	drop linkdt linkenddt;
+
+	rename linkdt_num = linkdt linkenddt_num = linkenddt;
+run;
+
+
+/* step 4 merge crsp with ccm (attached gvkey by link validity) */
+
+proc sql;
+	create table crsp_ccm as
+	select a.*, b.gvkey
+	from crsp as a 
+	inner join ccm as b
+		on a.permno = b.lpermno
+		and a.MthCalDt between b.linkdt and b.linkenddt;
+quit;
+
+
+/* step 5 merge crsp ccm with compustat */
+
+proc sql;
+	create table crsp_ccm_compustat_2024 as 
+	select a.*, b.*
+	from crsp_ccm as a 
+	left join compustat as b
+		on a.gvkey = b.gvkey
+		and year(a.MthCalDt) = year(b.datadate);
+quit;
+
+
+proc contents data = crsp_ccm_compustat_2024; run;
+/* step 6 export final merge */
+
+proc export data = crsp_ccm_compustat
+	outfile = "C:\Users\ma2281\OneDrive - UNT System\Desktop\Week 7 Assignment\crsp_ccm_compustat_2024.csv"
+	dbms=csv
+	replace;
+run;
+
+
+
+/* import etf constituents */
+
+proc import datafile = "etf_constituents.csv"
+	out = etf_constituents_raw
+	dbms = csv
+	replace;
+	guessingrows = max;
+	getnames = yes;
+
+run;
+
+
+proc contents data = etf_constituents_raw; run;
+
+
+/*clean constituents */
+
+data etf_constituents;
+	set etf_constituents_raw;
+
+	/* convert as_of_date to sas date */
+	as_of_date_num = input(strip(as_of_date), anydtdte.);
+	format as_of_date_num date9.;
+	drop as_of_date;
+	drop as_of_date;
+	rename as_of_date_num = as_of_date;
+
+
+	/* keep only january 2024 holdings */
+	if '01JAN2024'd <= as_of_date <= '31JAN2024'd;
+
+	/*keep only the 10 ETFs of interest */
+	if composite_ticker in ("JEPI", "DFAC", "JEPQ", "DYNF", "CGDV",
+							"AVUV", "DFUS", "CGGR", "DFIV", "AVEM");
+
+	run;
+
+
+	/* import etf industry data*/
+
+	proc import datafile = "etf_industry.csv"
+		out = etf_industry_raw
+		dbms = csv
+		replace;
+		guessingrows = max;
+		getnames = yes;
+	run;
+
+/*  clean industry */
+
+	data etf_industry;
+		set etf_industry_raw;
+
+		/* convert as_of_date to sas date */
+		as_of_date_num = input(strip(as_of_date), anydtdte.);
+		format as_of_date_num date9.;
+		drop as_of_date;
+		rename as_of_date_num = as_of_date;
+
+		/* keep january 2024 only */
+
+		if ' 01JAN2024'd <= as_of_date <= '31JAN2024'd;
+
+		/* keep only the same 10 etfs */
+
+	if composite_ticker in ("JEPI", "DFAC", "JEPQ", "DYNF", "CGDV",
+							"AVUV", "DFUS", "CGGR", "DFIV", "AVEM");
+
+run;
+
+
+/* merge constituents + industry attach aum */
+
+proc sort data = etf_constituents; by composite_ticker as_of_date; run;
+proc sort data = etf_industry;     by composite_ticker as_of_date; run;
+
+data etf_holdings;
+	merge etf_constituents (in=a)
+		  etf_industry (in=b keep=composite_ticker as_of_date aum);
+	by composite_ticker as_of_date;
+	if a;
+run;
+
+
+/* setp a build cusip 8 from isin if cusip is missing */
+
+data etf_holdings_clean;
+    set etf_holdings;
+
+    length cusip8 $8;
+
+    /* Use CUSIP if available */
+    if not missing(cusip) then cusip8 = substr(cusip,1,8);
+
+    /* Else derive from ISIN (characters 3–10 = base CUSIP) */
+    else if not missing(isin) then cusip8 = substr(isin,3,8);
+
+    /* Backup: keep ticker in uppercase for fallback */
+    ticker_key = upcase(constituent_ticker);
+run;
+
+
+/* --- Step B: Standardize firm data (CRSP–Compustat) --- */
+data firm_data;
+    set crsp_ccm_compustat_2024;
+    cusip8 = substr(HdrCUSIP,1,8);
+    ticker_key = upcase(ticker);
+	sic_code = sic; /* preserve sic */
+
+run;
+
+
+/* --- Step C: Merge on cusip8 first --- */
+proc sql;
+    create table etf_firm_link as
+    select a.*,
+           b.gvkey, b.permno, b.prcc_f, b.csho, b.at, b.ni, b.sale, b.cogs
+    from etf_holdings_clean as a
+    left join firm_data as b
+        on a.cusip8 = b.cusip8
+        and month(a.as_of_date) = month(b.MthCalDt)
+        and year(a.as_of_date)  = year(b.MthCalDt);
+quit;
+
+proc contents data=etf_firm_link; run;
+/* --- Step D: Fallback merge on ticker for those unmatched --- */
+proc sql;
+    create table etf_firm_link_final as
+    select 
+        x.composite_ticker,
+        x.as_of_date,
+        x.isin,
+        x.cusip8,
+        x.ticker_key,
+        coalesce(x.gvkey,y.gvkey) as gvkey,
+        coalesce(x.permno,y.permno) as permno,
+        coalesce(x.prcc_f,y.prcc_f) as prcc_f,
+        coalesce(x.csho,y.csho) as csho,
+        coalesce(x.at,y.at) as at,
+        coalesce(x.ni,y.ni) as ni,
+        coalesce(x.sale,y.sale) as sale,
+        coalesce(x.cogs,y.cogs) as cogs,
+        x.weight,
+        x.aum
+    from etf_firm_link as x
+    left join firm_data as y
+        on x.gvkey is null
+       and x.ticker_key = y.ticker_key
+       and month(x.as_of_date) = month(y.MthCalDt)
+       and year(x.as_of_date)  = year(y.MthCalDt);
+quit;
+
+/* qc  */
+
+proc sql;
+    select count(*) as total_holdings,
+           sum(case when gvkey is not null then 1 else 0 end) as matched_firms
+    from etf_firm_link_final;
+quit;
+
+/* Peek at merged data */
+proc print data=etf_firm_link_final (obs=100);
+    var composite_ticker as_of_date isin cusip8 ticker_key gvkey permno prcc_f csho weight aum;
+run;
+
+
+
+/*step 5 etf ownership  */
+
+/*----------------------------------------------------------
+ Step 5: Calculate ETF Ownership following Ben-David et al. (2018)
+-----------------------------------------------------------*/
+
+/* 1. Compute market capitalization for each firm observation */
+data firm_data2;
+    set etf_firm_link_final;  /* output from Step 4 */
+    if prcc_f > 0 and csho > 0 then mktcap = prcc_f * csho;
+	sic_code = sic; /* carry sic */
+run;
+
+/* 2. Compute ETF ownership per ETF–firm observation */
+data etf_ownership_step1;
+    set firm_data2;
+
+    /* NOTE: check if weight is percent or fraction.
+             If weight is in percent (e.g., 1.2 = 1.2%), then divide by 100 */
+    if mktcap > 0 then etf_ownership = (weight * aum) / mktcap;
+run;
+
+/* 3. Aggregate to firm–month level (sum across ETFs) */
+proc sql;
+    create table etf_ownership_firm as
+    select gvkey,
+           permno,
+           month(as_of_date) as month,
+           year(as_of_date) as year,
+           sum(etf_ownership) as total_etf_ownership
+    from etf_ownership_step1
+    group by gvkey, permno, year, month;
+quit;
+
+/* 4. QC checks */
+
+/* Basic descriptive statistics */
+proc means data=etf_ownership_firm n mean min max;
+    var total_etf_ownership;
+run;
+
+/* Preview first 20 firm-months */
+proc print data=etf_ownership_firm (obs=20); run;
+
+
+/*----------------------------------------------------------
+ Step 6: Descriptive Statistics of ETF Ownership
+----------------------------------------------------------*/
+
+/* 6a. Attach fundamentals back to ownership dataset */
+proc sql;
+    create table etf_final as
+    select a.*,
+           b.mktcap,
+           (b.ni / b.at) as roa,
+           ((b.sale - b.cogs) / b.at) as gross_profitability,
+		   b.sic_code
+    from etf_ownership_firm as a
+    left join firm_data2 as b
+        on a.gvkey = b.gvkey and a.permno = b.permno;
+quit;
+
+proc contents data = etf_final; run;
+/*----------------------------------------------------------
+ 6b. Overall Descriptive Statistics
+----------------------------------------------------------*/
+proc means data=etf_final mean median std min max;
+    var total_etf_ownership aum mktcap;
+    title "Overall Descriptive Statistics";
+run;
+
+
+/*----------------------------------------------------------
+ 6c. By Firm Size (quartiles of Market Cap)
+----------------------------------------------------------*/
+proc rank data=etf_final groups=4 out=etf_final_size;
+    var mktcap;
+    ranks size_group; /* 0 = smallest quartile, 3 = largest */
+run;
+
+proc means data=etf_final_size mean median std min max;
+    class size_group;
+    var total_etf_ownership;
+    title "ETF Ownership by Firm Size Quartiles";
+run;
+
+
+/*----------------------------------------------------------
+ 6d. By ROA (quartiles)
+----------------------------------------------------------*/
+proc rank data=etf_final groups=4 out=etf_final_roa;
+    var roa;
+    ranks roa_group;
+run;
+
+proc means data=etf_final_roa mean median std min max;
+    class roa_group;
+    var total_etf_ownership;
+    title "ETF Ownership by ROA Quartiles";
+run;
+
+
+/*----------------------------------------------------------
+ 6e. By Gross Profitability (quartiles)
+----------------------------------------------------------*/
+proc rank data=etf_final groups=4 out=etf_final_gp;
+    var gross_profitability;
+    ranks gp_group;
+run;
+
+proc means data=etf_final_gp mean median std min max;
+    class gp_group;
+    var total_etf_ownership;
+    title "ETF Ownership by Gross Profitability Quartiles";
+run;
+
+
+/*---------------------------------------------------------- */
+ /* 6f. By Industry (placeholder – requires Fama-French merge)*/
+/* Import FF10 classification file (SIC ranges) */
+proc import datafile="ff10_industry.txt"
+    out=ff10_raw
+    dbms=dlm
+    replace;
+    guessingrows=max;
+    delimiter='09'x; /* tab-delimited */
+    getnames=no;
+run;
+
+/* Step 2: Clean it (assume columns like VAR1=industry_id, VAR2=name, VAR3=SIC ranges text) */
+data ff10_map;
+    set ff10_raw;
+    ff10_industry_id = input(var1,8.);
+    industry_name = var2;
+    sic_ranges = var3;
+run;
+
+/* Step 3: Manually expand SIC ranges into a lookup (example: nodur covers 0100–0999, 2000–2399, …) */
+data ff10_lookup;
+    set ff10_map;
+    length sic_start sic_end 8;
+    /* You’ll need to parse ranges from the txt file or create them manually based on Kenneth French’s definitions */
+run;
+
+
+proc contents data=firm_data2; run;
+
+proc contents data = compustat_raw; run;
+/* Step 4: Merge by SIC */
+proc sql;
+    create table etf_final_industry as
+    select a.*, b.ff10_industry_id, b.industry_name
+    from etf_final as a
+    left join ff10_lookup as b
+      on a.sic_code between b.sic_start and b.sic_end;
+quit;
+
+
+/*----------------------------------------------------------
+ Step 6g. Descriptive Stats by Fama-French Industry
+----------------------------------------------------------*/
+proc means data=etf_final_industry mean median std min max;
+    class ff10_industry_id;
+    var total_etf_ownership;
+    title "ETF Ownership by Fama-French 10 Industries";
+run;
+
+
+
+/* wrap things up */
+
+libname out "C:\Users\output_directory";
+
+data out.final_dataset_etf;
+    set etf_final_industry;
+run;
+
+ods pdf file="C:outputfile.pdf";
+
+/* rerun Step 6 code here (proc means, proc rank, etc.) */
+/* Overall stats */
+proc means data=etf_final mean median std min max;
+    var total_etf_ownership aum mktcap;
+    title "Overall Descriptive Statistics";
+run;
+
+/* Add size/ROA/gross profitability/industry breakdowns here */
+
+ods pdf close;
